@@ -15,8 +15,8 @@ See [Here](/EXPLAINED.MD) for an AI generated explanation of how this works to b
 Upload this repo to the Frame, run install-service.sh
 
 Stream URLs for EyeTrackVR should now be available at:
-http://<frame IP>:8090/1
-http://<frame IP>:8090/0
+http://frame local IP:8090/1
+http://frame local IP:8090/0
 
 **You do this at your own risk.**
 This repo is here only as a proof of concept, I'd highly advise against using this if you're not familiar with what you're doing or how to fix any problems that may arise!
