@@ -1,6 +1,6 @@
 # FrameEyeCameraFeed — Steam Frame eye camera capture
 
-**Disclaimer:** This is heavily **AI generated**, use at your own risk. This project was made a proof-of-concept, something for other developers to use as a reference.
+**Disclaimer:** This is heavily **AI generated**, use at your own risk.
 
 Captures the Steam Frame eye camera feeds and hosts them in a format accepted by EyeTrackVR.
 
@@ -19,13 +19,34 @@ curl -fsSL https://github.com/Curtis-VL/FrameEyeCameraFeed/releases/latest/downl
 
 This downloads the latest release, verifies its checksum, and installs it as a service that starts on boot.
 
+Re-run the same command to update, or if a major SteamOS update removes the service.
+
 Stream URLs for EyeTrackVR should now be available at:
 
-http://frame:8090/1
+http://frame-local-ip:8090/1
 
-http://frame:8090/0
+http://frame-local-ip:8090/0
 
 The installer prints the exact addresses when it finishes, but the above should work regardless.
+
+**Note:** It may be best to look at your router's DHCP settings to ensure the Frame's IP remains the same over time.
+
+# Check status
+
+You can check the status of the application and preview the camera feeds at:
+
+http://frame-local-ip:8090
+
+There's also a JSON status that you can hook into at:
+
+http://frame-local-ip:8090/status
+
+# Uninstall
+
+```bash
+curl -fsSL https://github.com/Curtis-VL/FrameEyeCameraFeed/releases/latest/download/install.sh | sudo bash -s -- --uninstall
+```
+# Options
 
 Options go after `sudo`:
 
@@ -35,11 +56,6 @@ Options go after `sudo`:
 | Extra options, e.g. swap eyes | `... \| sudo ARGS="--swap" bash` |
 | Specific release | `... \| sudo VERSION=v1.0.0 bash` |
 | Uninstall | `... \| sudo bash -s -- --uninstall` |
-
-Re-run the same command to update, or if a major SteamOS update removes the service.
-
-**You do this at your own risk.**
-I'd advise only using this if you're also familiar enough with Linux to fix any issues that could come up.
 
 # Troubleshooting
 
@@ -51,3 +67,13 @@ That's what happens when the proximity sensor is just covered instead of the hea
 
 Eye camera streams appear wrong?
 Take off the headset for a few seconds, put it back on.
+
+# Disclaimer
+
+**You use this at your own risk.**
+
+I'd advise only using this if you're also familiar enough with Linux to fix any issues that could come up.
+
+There's an awful lot of AI code in here, which I wouldn't normally be comfortable with posting publicly.
+
+However, given that this is such a small project and likely to be replaced by Babble's own solution in the near future... It'll do for now!
