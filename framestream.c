@@ -1988,19 +1988,37 @@ static void serve_status(int fd)
 
 static void serve_index(int fd)
 {
-    char body[1600];
+    char body[2048];
 
+    /*
+     * The addresses are filled in by the browser from the address it used to
+     * reach this page, which is by definition one that works from that
+     * machine.  Doing it server-side would mean echoing the request's Host
+     * header into the page unchecked.
+     */
     snprintf(body, sizeof(body),
              "<!doctype html><meta charset=utf-8>"
              "<title>Steam Frame eye cameras</title>"
              "<style>body{font:14px system-ui;margin:2rem;background:#111;color:#eee}"
-             "img{border:1px solid #444;margin-right:1rem}code{color:#9cf}</style>"
+             ".cams{display:flex;flex-wrap:wrap;gap:1rem}"
+             "figure{margin:0}figcaption{margin-top:.4rem}"
+             "img{border:1px solid #444;max-width:100%%}code{color:#9cf}</style>"
              "<h2>Steam Frame eye cameras</h2>"
-             "<p>Paste one of these into the EyeTrackVR camera address field:</p>"
-             "<p><code>http://%%HOST%%:%d/0</code> &nbsp; "
-             "<code>http://%%HOST%%:%d/1</code></p>"
-             "<img src=\"/0\" width=384><img src=\"/1\" width=384>"
-             "<p><a style=color:#9cf href=\"/status\">/status</a></p>",
+             "<p>EyeTrackVR has two camera address fields, one per eye. "
+             "Paste one of these addresses into each:</p>"
+             "<div class=cams>"
+             "<figure><img src=\"/0\" width=384>"
+             "<figcaption><code class=url data-path=/0>http://&lt;headset-ip&gt;:%d/0</code>"
+             "</figcaption></figure>"
+             "<figure><img src=\"/1\" width=384>"
+             "<figcaption><code class=url data-path=/1>http://&lt;headset-ip&gt;:%d/1</code>"
+             "</figcaption></figure>"
+             "</div>"
+             "<p>If they're the wrong way round, swap them in EyeTrackVR or reinstall "
+             "with <code>ARGS=\"--swap\"</code>.</p>"
+             "<p><a style=color:#9cf href=\"/status\">/status</a></p>"
+             "<script>for(const e of document.querySelectorAll('.url'))"
+             "e.textContent=location.origin+e.dataset.path</script>",
              opt_port, opt_port);
 
     send_simple(fd, "200 OK", "text/html; charset=utf-8", body);
