@@ -15,7 +15,7 @@ This application provides the eye camera feeds from the Steam Frame in a format 
 
 EyeTrackVR seems to have some troubles with the gaze, however, it will provide lid position (Blink/Wink) and also pupil dilation.
 
-In my own testing, I used Steam Link's 'Enable OSC' and 'Share face tracking data to other apps on this PC via OSC' options for gaze, whilst using ETVR for link and pupil dilation.
+In my own testing, I used Steam Link's 'Enable OSC' and 'Share face tracking data to other apps on this PC via OSC' options for gaze, whilst using ETVR for lid position and pupil dilation.
 
 The gaze tracking from Steam Link is jittery locally, but this jittery isn't really visible to others over the network.
 
