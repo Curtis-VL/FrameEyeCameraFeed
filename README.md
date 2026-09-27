@@ -17,6 +17,13 @@ EyeTrackVR seems to have some troubles with the gaze, however, it will provide l
 
 In my own testing, I used Steam Link's 'Enable OSC' and 'Share face tracking data to other apps on this PC via OSC' options for gaze, whilst using ETVR for link and pupil dilation.
 
+The gaze tracking from Steam Link is jittery locally, but this jittery isn't really visible to others over the network.
+
+https://github.com/user-attachments/assets/133d68aa-2698-489c-870e-a1b597f286f2
+
+(There's no pupil dilation on my avatar, but you get the gist)
+
+
 # How to Use
 
 On the Frame, open a terminal and run:
