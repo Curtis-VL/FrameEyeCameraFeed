@@ -26,7 +26,9 @@ https://github.com/user-attachments/assets/133d68aa-2698-489c-870e-a1b597f286f2
 
 # How to Use
 
-On the Frame, open a terminal and run:
+You'll need to set the user password in the developer settings on the headset to either connect to the headset via SSH, or to enter the admin password whem prompted to run the following command.
+
+To install, run:
 
 ```bash
 curl -fsSL https://github.com/Curtis-VL/FrameEyeCameraFeed/releases/latest/download/install.sh | sudo bash
