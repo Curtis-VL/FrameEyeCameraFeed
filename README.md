@@ -58,6 +58,9 @@ There's also a JSON status that you can hook into at:
 
 http://frame-local-ip:8090/status
 
+<img width="837" height="498" alt="image" src="https://github.com/user-attachments/assets/2da6e4a1-0ae1-4047-8707-320909434236" />
+
+
 # Uninstall
 
 ```bash
