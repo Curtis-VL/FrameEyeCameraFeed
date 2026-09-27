@@ -187,6 +187,8 @@ static void logmsg(const char *fmt, ...)
     fflush(stderr);
 }
 
+#define vlog(...) do { if (opt_verbose) logmsg(__VA_ARGS__); } while (0)
+
 static void set_status(const char *fmt, ...)
 {
     va_list ap;
@@ -217,6 +219,61 @@ static int pidfd_getfd_sys(int pidfd, int targetfd)
     return (int)syscall(SYS_pidfd_getfd, pidfd, targetfd, 0u);
 }
 
+/*
+ * The frames are written by hardware that does not snoop the CPU caches, and
+ * nothing here tells the kernel when we read them.  So once a line has been
+ * read, the cached copy can keep returning an old frame long after the device
+ * has rewritten memory - the stream freezes, or never starts.
+ *
+ * DMA_BUF_IOCTL_SYNC is the official fix, but on a udmabuf it syncs the whole
+ * 16-32 MB heap every call.  Instead, clean+invalidate exactly the lines about
+ * to be read, so they come from memory.  DC CIVAC is allowed from user space
+ * on arm64 Linux, and because it cleans first it can never discard somebody
+ * else's write.
+ *
+ * Earlier versions got away without this by accident: a scan of the whole
+ * arena on every pass of the capture loop pushed everything out of cache.
+ */
+static size_t cache_line = 64;
+
+static void cache_setup(void)
+{
+#if defined(__aarch64__)
+    uint64_t ctr;
+
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+
+    cache_line = (size_t)4 << ((ctr >> 16) & 0xf);   /* DminLine, in bytes */
+#endif
+}
+
+static inline void cache_drop_line(const void *p)
+{
+#if defined(__aarch64__)
+    __asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
+#else
+    (void)p;
+#endif
+}
+
+static inline void cache_barrier(void)
+{
+#if defined(__aarch64__)
+    __asm__ volatile("dsb ish" ::: "memory");
+#endif
+}
+
+static void cache_drop_range(const unsigned char *p, size_t len)
+{
+    uintptr_t a   = (uintptr_t)p & ~(uintptr_t)(cache_line - 1);
+    uintptr_t end = (uintptr_t)p + len;
+
+    for (; a < end; a += cache_line)
+        cache_drop_line((const void *)a);
+
+    cache_barrier();
+}
+
 static uint64_t fingerprint(const unsigned char *p, size_t len)
 {
     uint64_t h    = 1469598103934665603ULL;
@@ -224,6 +281,12 @@ static uint64_t fingerprint(const unsigned char *p, size_t len)
 
     if (step == 0)
         step = 1;
+
+    /* make sure the samples come from memory, not a stale cache line */
+    for (size_t i = 0; i < len; i += step)
+        cache_drop_line(p + i);
+
+    cache_barrier();
 
     for (size_t i = 0; i < len; i += step) {
         h ^= p[i];
@@ -523,7 +586,7 @@ static bool attach_arenas(void)
  * row-to-row difference, waved it through.  Roughness is only useful as an
  * upper bound to reject pure noise.
  */
-static bool looks_like_eye_frame(const unsigned char *p)
+static void frame_stats(const unsigned char *p, double *litfrac, double *smooth)
 {
     long   lit = 0, n = 0, nr = 0;
     double rough = 0;
@@ -543,11 +606,15 @@ static bool looks_like_eye_frame(const unsigned char *p)
             }
         }
 
-    if (!n || !nr)
-        return false;
+    *litfrac = n  ? (double)lit / n : 0;
+    *smooth  = nr ? rough / nr      : 1e9;
+}
 
-    double litfrac = (double)lit / n;
-    double smooth  = rough / nr;
+static bool looks_like_eye_frame(const unsigned char *p)
+{
+    double litfrac, smooth;
+
+    frame_stats(p, &litfrac, &smooth);
 
     return litfrac >= 0.20 && litfrac <= 0.96 && smooth <= 15.0;
 }
@@ -845,6 +912,8 @@ static bool discover_ring(void)
         }
     }
 
+    vlog("search: %d candidate frame(s) in changed memory", ncand);
+
     if (ncand < 2)
         return false;
 
@@ -918,6 +987,10 @@ static bool discover_ring(void)
 
             usleep(4000);
         }
+
+        for (int k = 0; k < ncand; k++)
+            vlog("  candidate 0x%zx (arena %d): %d refreshes in 1 s%s",
+                 cand[k].off, a, hits[k], hits[k] >= 5 ? "" : "  -> dropped");
 
         int keep = 0;
 
@@ -1018,6 +1091,26 @@ static bool discover_ring(void)
         n++;
     }
 
+    if (opt_verbose) {
+
+        vlog("  ring walk: %d slot(s) from 0x%lx, pitch %ld", n, first, pitch);
+
+        /* the slots found, plus the two positions either side of the run */
+        for (int k = -1; k <= n; k++) {
+
+            long o = first + (long)k * pitch;
+
+            if (o < 0 || (size_t)o + need > arenas[a].size)
+                continue;
+
+            double lit, sm;
+
+            frame_stats(arenas[a].map + o, &lit, &sm);
+            vlog("    %s 0x%lx  lit %.2f  rough %.1f",
+                 k < 0 || k == n ? "past " : "slot ", o, lit, sm);
+        }
+    }
+
     if (n < 2)
         return false;
 
@@ -1101,6 +1194,10 @@ static bool discover_ring(void)
         int keep = 0;
 
         for (int k = 0; k < n; k++)
+            if (!seen[k])
+                vlog("  slot 0x%zx did not refresh in 0.6 s -> dropped", ring_off[k]);
+
+        for (int k = 0; k < n; k++)
             if (seen[k])
                 ring_off[keep++] = ring_off[k];
 
@@ -1136,6 +1233,11 @@ static bool discover_ring(void)
     }
 
     double split = (dmin + dmax) / 2;
+
+    for (int k = 0; k < n; k++)
+        vlog("  slot %d distance from slot 0: %.2f", k, dist[k]);
+
+    vlog("  spread %.2f (under 0.8 means one eye only)", dmax - dmin);
 
     for (int k = 0; k < n; k++)
         slot_eye[k] = dist[k] > split ? 1 : 0;
@@ -1219,6 +1321,9 @@ static size_t encode_jpeg(stream_t *st, const unsigned char *src, int flip)
 
     JSAMPROW rows[EYE_HEIGHT];
     bool     copy = (flip & FLIP_H) || out_scale > 1;
+
+    /* the whole frame has to come from memory, not just the sampled lines */
+    cache_drop_range(src, (size_t)EYE_STRIDE * EYE_HEIGHT);
 
     for (unsigned y = 0; y < out_h; y++) {
 
@@ -1349,6 +1454,9 @@ static void *capture_thread(void *arg)
     int    misaligned = 0;
     bool   locked     = false;
 
+    int    refreshes[MAX_RING] = { 0 };     /* --verbose statistics */
+    double last_report = 0;
+
     while (running) {
 
         if (xr_pid && process_exited(xr_pidfd)) {
@@ -1409,9 +1517,10 @@ static void *capture_thread(void *arg)
                 last_scan = now_sec();
 
                 if (discover_ring()) {
-                    locked     = true;
-                    last_any   = now_sec();
-                    last_check = now_sec();
+                    locked      = true;
+                    last_any    = now_sec();
+                    last_check  = now_sec();
+                    last_report = now_sec();
                     misaligned = 0;
                     set_status("streaming: ring of %d slot(s)", ring_slots);
                 } else {
@@ -1437,6 +1546,7 @@ static void *capture_thread(void *arg)
 
             ring_fp[i] = fp;
             any = true;
+            refreshes[i]++;
 
             int phys = slot_eye[i];
             int strm = opt_swap ? 1 - phys : phys;
@@ -1448,6 +1558,21 @@ static void *capture_thread(void *arg)
 
         if (any)
             last_any = t;
+
+        if (opt_verbose && t - last_report >= 5.0) {
+
+            char line[MAX_RING * 6 + 1];
+            int  lp = 0;
+
+            for (int i = 0; i < ring_slots && lp < (int)sizeof(line) - 6; i++)
+                lp += snprintf(line + lp, sizeof(line) - lp, " %d", refreshes[i]);
+
+            line[lp] = 0;
+            logmsg("slot refreshes in the last %.0f s:%s", t - last_report, line);
+
+            memset(refreshes, 0, sizeof(refreshes));
+            last_report = t;
+        }
 
         /*
          * Re-check alignment periodically.  Each origin is pinned once at lock
@@ -1875,7 +2000,8 @@ static void usage(const char *a0)
 "                    (default none)\n"
 "  --flip1 MODE      same for eye 1 (default v - that camera is mounted\n"
 "                    upside down)\n"
-"  --verbose         log every state change\n"
+"  --verbose         explain slot discovery, and log how often each slot\n"
+"                    refreshes\n"
 "\n"
 "Endpoints:  /0 /1 (MJPEG, one eye each)   /left /right (aliases)\n"
 "            /2 or /full (newest frame, unclassified - use to tune crops)\n"
@@ -1932,8 +2058,6 @@ int main(int argc, char **argv)
         }
     }
 
-    (void)opt_verbose;
-
     /* settle the crop and scale once instead of on every frame */
     {
         unsigned cw = opt_cw > 0 ? (unsigned)opt_cw : EYE_STRIDE;
@@ -1958,6 +2082,8 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
+
+    cache_setup();
 
     for (int i = 0; i < MAX_STREAMS; i++) {
         pthread_mutex_init(&streams[i].lock, NULL);
