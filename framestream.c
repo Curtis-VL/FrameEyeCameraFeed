@@ -21,7 +21,7 @@
  *   - Frames only exist while the headset is being worn, so it locks on when
  *     they start flowing and keeps serving the last good frame when they stop.
  *
- * Build:  gcc -O2 -g -Wall -o framestream framestream.c -ljpeg -lpthread -lm
+ * Build:  make   (or: gcc -O2 -Wall -o framestream framestream.c -ljpeg -lpthread -lm)
  * Needs root: pidfd_getfd() is blocked by kernel.yama.ptrace_scope=1.
  */
 
@@ -37,6 +37,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -94,12 +95,17 @@ typedef struct {
     size_t          jpgcap;
     uint64_t        seq;
 
-    bool            bound;          /* has a source slot                     */
-    int             arena;
-    size_t          off;
-    uint64_t        fp;
-    double          last_frame;     /* when the source last changed          */
-    uint64_t        frames;
+    double          last_src;       /* when the source last changed          */
+    uint64_t        frames;         /* source frames seen, encoded or not    */
+
+    atomic_int      viewers;        /* clients that want this one encoded    */
+
+    /* capture thread only - encoding happens outside the lock */
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr       jerr;
+    unsigned char  *spare;          /* encode target, swapped with jpg       */
+    size_t          sparecap;
+    double          next_due;       /* output rate limiter schedule          */
 } stream_t;
 
 /* --------------------------------------------------------------- globals */
@@ -108,7 +114,6 @@ static arena_t  arenas[MAX_ARENAS];
 static int      narenas;
 
 static stream_t streams[MAX_STREAMS];
-static int      nstreams;
 
 static pid_t    xr_pid;
 static int      xr_pidfd = -1;
@@ -130,6 +135,9 @@ static int      opt_scale    = 1;
 static bool     opt_verbose  = false;
 static bool     opt_swap     = false;
 static int      opt_cx = 0, opt_cy = 0, opt_cw = 0, opt_ch = 0;
+
+/* output geometry, settled once from --crop and --scale */
+static unsigned out_x, out_y, out_w, out_h, out_scale;
 
 /*
  * Orientation fix per physical eye camera.  Eye 1 is mounted upside down
@@ -273,32 +281,16 @@ static pid_t find_process(const char *needle)
     return found;
 }
 
-static bool process_alive(pid_t pid, const char *needle)
+/*
+ * A pidfd polls readable once its process has exited.  This runs on every
+ * pass of the capture loop, so it replaces re-reading /proc/<pid>/cmdline a
+ * few hundred times a second.
+ */
+static bool process_exited(int pidfd)
 {
-    if (pid <= 0)
-        return false;
+    struct pollfd pfd = { .fd = pidfd, .events = POLLIN };
 
-    char path[288];
-    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
-
-    FILE *f = fopen(path, "rb");
-
-    if (!f)
-        return false;
-
-    char buf[512];
-    memset(buf, 0, sizeof(buf));
-
-    size_t got = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-
-    if (!got)
-        return false;
-
-    const char *base = strrchr(buf, '/');
-    base = base ? base + 1 : buf;
-
-    return strstr(base, needle) != NULL;
+    return poll(&pfd, 1, 0) > 0;
 }
 
 static bool read_dmabuf_info(pid_t pid, int fd, size_t *size, unsigned long *ino)
@@ -345,14 +337,6 @@ static void drop_arenas(void)
     }
 
     narenas = 0;
-
-    for (int i = 0; i < nstreams; i++) {
-        pthread_mutex_lock(&streams[i].lock);
-        streams[i].bound = false;
-        pthread_mutex_unlock(&streams[i].lock);
-    }
-
-    nstreams = 0;
 
     if (xr_pidfd >= 0) {
         close(xr_pidfd);
@@ -803,6 +787,18 @@ static void clear_block_changes(void)
         memset(arenas[a].blockchanged, 0, sizeof(arenas[a].blockchanged));
 }
 
+/*
+ * Block tracking only runs while searching - fingerprinting every 64 KiB of
+ * both arenas on each 3 ms pass of the locked loop was the single biggest
+ * cost in the process.  So on leaving the lock the stored fingerprints are
+ * stale; re-take them so only changes from here on count.
+ */
+static void reset_block_changes(void)
+{
+    note_block_changes();
+    clear_block_changes();
+}
+
 static bool discover_ring(void)
 {
     size_t need = (size_t)EYE_STRIDE * EYE_HEIGHT;
@@ -1191,125 +1187,154 @@ static bool discover_ring(void)
 
 /* ---------------------------------------------------------- JPEG encoding */
 
-static bool encode_jpeg(const unsigned char *src,
-                        int flip,
-                        unsigned char **out,
-                        size_t *outlen,
-                        size_t *outcap)
+static void setup_encoder(stream_t *st)
 {
-    unsigned cx = opt_cx, cy = opt_cy;
-    unsigned cw = opt_cw ? (unsigned)opt_cw : EYE_STRIDE;
-    unsigned ch = opt_ch ? (unsigned)opt_ch : EYE_HEIGHT;
+    st->cinfo.err = jpeg_std_error(&st->jerr);
+    jpeg_create_compress(&st->cinfo);
 
-    if (cx >= EYE_STRIDE) cx = 0;
-    if (cy >= EYE_HEIGHT) cy = 0;
-    if (cx + cw > EYE_STRIDE) cw = EYE_STRIDE - cx;
-    if (cy + ch > EYE_HEIGHT) ch = EYE_HEIGHT - cy;
+    st->cinfo.image_width      = out_w;
+    st->cinfo.image_height     = out_h;
+    st->cinfo.input_components = 1;
+    st->cinfo.in_color_space   = JCS_GRAYSCALE;
 
-    unsigned sc = opt_scale < 1 ? 1 : (unsigned)opt_scale;
-    unsigned w  = cw / sc;
-    unsigned h  = ch / sc;
+    jpeg_set_defaults(&st->cinfo);
+    jpeg_set_quality(&st->cinfo, opt_quality, TRUE);
 
-    if (!w || !h)
-        return false;
+    /* a grey frame this size practically never encodes larger than raw */
+    st->sparecap = (size_t)EYE_STRIDE * EYE_HEIGHT;
+    st->spare    = malloc(st->sparecap);
 
-    struct jpeg_compress_struct cinfo;
-    struct jpeg_error_mgr       jerr;
+    if (!st->spare)
+        st->sparecap = 0;
+}
 
-    cinfo.err = jpeg_std_error(&jerr);
-    jpeg_create_compress(&cinfo);
+/*
+ * Encode into st->spare and return the length.  The compressor, its buffer
+ * and the row table are all reused, so a frame costs no allocations.  Rows
+ * that need no rearranging are handed to libjpeg straight from the source.
+ */
+static size_t encode_jpeg(stream_t *st, const unsigned char *src, int flip)
+{
+    static unsigned char tmp[EYE_STRIDE * EYE_HEIGHT];
 
-    unsigned long  mem_len = 0;
-    unsigned char *mem     = NULL;
+    JSAMPROW rows[EYE_HEIGHT];
+    bool     copy = (flip & FLIP_H) || out_scale > 1;
 
-    jpeg_mem_dest(&cinfo, &mem, &mem_len);
+    for (unsigned y = 0; y < out_h; y++) {
 
-    cinfo.image_width      = w;
-    cinfo.image_height     = h;
-    cinfo.input_components = 1;
-    cinfo.in_color_space   = JCS_GRAYSCALE;
+        unsigned oy = (flip & FLIP_V) ? out_h - 1 - y : y;
 
-    jpeg_set_defaults(&cinfo);
-    jpeg_set_quality(&cinfo, opt_quality, TRUE);
-    jpeg_start_compress(&cinfo, TRUE);
+        const unsigned char *s = src + (size_t)(out_y + oy * out_scale) * EYE_STRIDE
+                                     + out_x;
 
-    unsigned char row[EYE_STRIDE];
-
-    while (cinfo.next_scanline < h) {
-
-        unsigned oy = (flip & FLIP_V) ? (h - 1 - cinfo.next_scanline)
-                                      : cinfo.next_scanline;
-
-        const unsigned char *s = src + (size_t)(cy + oy * sc) * EYE_STRIDE + cx;
-
-        if (flip & FLIP_H)
-            for (unsigned x = 0; x < w; x++)
-                row[x] = s[(w - 1 - x) * sc];
-        else if (sc == 1)
-            memcpy(row, s, w);
-        else
-            for (unsigned x = 0; x < w; x++)
-                row[x] = s[x * sc];
-
-        JSAMPROW rp = row;
-        jpeg_write_scanlines(&cinfo, &rp, 1);
-    }
-
-    jpeg_finish_compress(&cinfo);
-    jpeg_destroy_compress(&cinfo);
-
-    if (*outcap < mem_len) {
-
-        unsigned char *nb = realloc(*out, mem_len);
-
-        if (!nb) {
-            free(mem);
-            return false;
+        if (!copy) {
+            rows[y] = (JSAMPROW)s;
+            continue;
         }
 
-        *out    = nb;
-        *outcap = mem_len;
+        unsigned char *d = tmp + (size_t)y * EYE_STRIDE;
+
+        if (flip & FLIP_H)
+            for (unsigned x = 0; x < out_w; x++)
+                d[x] = s[(out_w - 1 - x) * out_scale];
+        else
+            for (unsigned x = 0; x < out_w; x++)
+                d[x] = s[x * out_scale];
+
+        rows[y] = d;
     }
 
-    memcpy(*out, mem, mem_len);
-    *outlen = mem_len;
+    unsigned char *buf  = st->spare;
+    unsigned long  size = st->sparecap;
 
-    free(mem);
+    jpeg_mem_dest(&st->cinfo, &buf, &size);
+    jpeg_start_compress(&st->cinfo, TRUE);
+
+    while (st->cinfo.next_scanline < out_h)
+        jpeg_write_scanlines(&st->cinfo, rows + st->cinfo.next_scanline,
+                             out_h - st->cinfo.next_scanline);
+
+    jpeg_finish_compress(&st->cinfo);
+
+    /* libjpeg outgrew our buffer and allocated its own - adopt that one */
+    if (buf != st->spare) {
+        free(st->spare);
+        st->spare    = buf;
+        st->sparecap = size;
+    }
+
+    return size;
+}
+
+/* Encode unconditionally and hand the result to the clients. */
+static void publish_frame(stream_t *st, const unsigned char *src, int flip)
+{
+    size_t len = encode_jpeg(st, src, flip);
+
+    pthread_mutex_lock(&st->lock);
+
+    unsigned char *old    = st->jpg;
+    size_t         oldcap = st->jpgcap;
+
+    st->jpg      = st->spare;
+    st->jpgcap   = st->sparecap;
+    st->jpglen   = len;
+    st->spare    = old;
+    st->sparecap = oldcap;
+    st->seq++;
+
+    pthread_cond_broadcast(&st->cv);
+    pthread_mutex_unlock(&st->lock);
+}
+
+/*
+ * Output rate limiter.  It keeps a schedule rather than timing from the last
+ * frame, and allows a quarter-interval of slack: frames are only noticed on a
+ * 3 ms poll, so a strict "at least 1/fps since the last one" test drops every
+ * frame that happens to be seen a hair early and lands well under the target.
+ */
+static bool rate_ok(double *next_due, double t)
+{
+    if (opt_fps <= 0)
+        return true;
+
+    double iv = 1.0 / opt_fps;
+
+    if (t < *next_due - iv / 4)
+        return false;
+
+    /* after a gap, restart the schedule instead of bursting to catch up */
+    *next_due = (*next_due < t - iv ? t : *next_due) + iv;
 
     return true;
 }
 
-static void publish(stream_t *st, const unsigned char *src, int flip)
+static void publish(stream_t *st, const unsigned char *src, int flip, double t)
 {
+    pthread_mutex_lock(&st->lock);
+    st->frames++;
+    st->last_src = t;
+    pthread_mutex_unlock(&st->lock);
+
     /*
-     * No point encoding faster than we will ever send.  The ring delivers
-     * frames well above the output rate, and encoding all of them cost most of
-     * a CPU core for nothing.
+     * Encoding is the expensive part, so only do it for streams someone is
+     * actually watching - /2 in particular is a debugging view that used to
+     * be encoded at full rate all the time.  And there is no point encoding
+     * faster than we will ever send: the ring delivers frames well above the
+     * output rate.
      */
-    if (opt_fps > 0 && now_sec() - st->last_frame < 1.0 / opt_fps)
+    if (!atomic_load(&st->viewers) || !rate_ok(&st->next_due, t))
         return;
 
-    pthread_mutex_lock(&st->lock);
-
-    if (encode_jpeg(src, flip, &st->jpg, &st->jpglen, &st->jpgcap)) {
-        st->seq++;
-        st->frames++;
-        st->last_frame = now_sec();
-        st->bound      = true;
-        pthread_cond_broadcast(&st->cv);
-    }
-
-    pthread_mutex_unlock(&st->lock);
+    publish_frame(st, src, flip);
 }
 
 static void publish_placeholder(void)
 {
     static unsigned char blank[EYE_STRIDE * EYE_HEIGHT];
 
-    for (int i = 0; i < MAX_STREAMS; i++) {
-        publish(&streams[i], blank, 0);
-        streams[i].bound = false;
-    }
+    for (int i = 0; i < MAX_STREAMS; i++)
+        publish_frame(&streams[i], blank, 0);
 }
 
 /* ------------------------------------------------------- capture pipeline */
@@ -1326,7 +1351,7 @@ static void *capture_thread(void *arg)
 
     while (running) {
 
-        if (xr_pid && !process_alive(xr_pid, "XRService")) {
+        if (xr_pid && process_exited(xr_pidfd)) {
             logmsg("XRService went away, releasing buffers");
             drop_arenas();
             locked = false;
@@ -1372,9 +1397,9 @@ static void *capture_thread(void *arg)
             last_scan = now_sec();
         }
 
-        note_block_changes();
-
         if (!locked) {
+
+            note_block_changes();
 
             set_status("waiting for eye frames - put the headset on "
                        "(or cover the proximity sensor)");
@@ -1399,7 +1424,8 @@ static void *capture_thread(void *arg)
         }
 
         /* Locked: whichever slot just changed is holding the newest frame. */
-        bool any = false;
+        bool   any = false;
+        double t   = now_sec();
 
         for (int i = 0; i < ring_slots; i++) {
 
@@ -1416,12 +1442,12 @@ static void *capture_thread(void *arg)
             int strm = opt_swap ? 1 - phys : phys;
 
             /* stream 2 is the raw frame, unflipped, for checking framing */
-            publish(&streams[2], src, 0);
-            publish(&streams[strm], src, opt_flip[phys]);
+            publish(&streams[2], src, 0, t);
+            publish(&streams[strm], src, opt_flip[phys], t);
         }
 
         if (any)
-            last_any = now_sec();
+            last_any = t;
 
         /*
          * Re-check alignment periodically.  Each origin is pinned once at lock
@@ -1443,7 +1469,7 @@ static void *capture_thread(void *arg)
                 logmsg("frame alignment drifted, re-locking");
                 misaligned = 0;
                 locked     = false;
-                clear_block_changes();
+                reset_block_changes();
                 continue;
             }
         }
@@ -1451,7 +1477,7 @@ static void *capture_thread(void *arg)
         if (now_sec() - last_any > 10.0) {
             logmsg("eye frames stopped, rescanning");
             locked = false;
-            clear_block_changes();
+            reset_block_changes();
             set_status("idle - headset not worn");
         }
 
@@ -1536,6 +1562,20 @@ static bool peer_gone(int fd)
     return (pfd.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0;
 }
 
+/* absolute CLOCK_REALTIME deadline for pthread_cond_timedwait */
+static void deadline_in(struct timespec *ts, long ms)
+{
+    clock_gettime(CLOCK_REALTIME, ts);
+
+    ts->tv_sec  += ms / 1000;
+    ts->tv_nsec += (ms % 1000) * 1000000L;
+
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec  += 1;
+        ts->tv_nsec -= 1000000000L;
+    }
+}
+
 static void serve_mjpeg(int fd, int idx)
 {
     char hdr[512];
@@ -1552,19 +1592,21 @@ static void serve_mjpeg(int fd, int idx)
     if (!write_all(fd, hdr, (size_t)n))
         return;
 
-    stream_t *st  = &streams[idx];
-    uint64_t  got = 0;
+    stream_t      *st  = &streams[idx];
+    uint64_t       got = 0;
+    unsigned char *buf = NULL;
+    size_t         cap = 0;
 
-    double min_interval = opt_fps > 0 ? 1.0 / opt_fps : 0.0;
-    double last_sent    = 0;
+    atomic_fetch_add(&st->viewers, 1);
 
-    while (running) {
+    /*
+     * The output rate is already capped where frames are encoded, so every
+     * new frame goes straight out.  Pacing here as well used to throw away a
+     * frame it had already taken and then wait for the next one.
+     */
+    while (running && !peer_gone(fd)) {
 
-        if (peer_gone(fd))
-            return;
-
-        unsigned char *copy = NULL;
-        size_t         len  = 0;
+        size_t len = 0;
 
         pthread_mutex_lock(&st->lock);
 
@@ -1572,15 +1614,7 @@ static void serve_mjpeg(int fd, int idx)
 
             struct timespec ts;
 
-            clock_gettime(CLOCK_REALTIME, &ts);
-
-            ts.tv_nsec += 100 * 1000000L;
-
-            if (ts.tv_nsec >= 1000000000L) {
-                ts.tv_sec  += 1;
-                ts.tv_nsec -= 1000000000L;
-            }
-
+            deadline_in(&ts, 100);
             pthread_cond_timedwait(&st->cv, &st->lock, &ts);
         }
 
@@ -1590,30 +1624,31 @@ static void serve_mjpeg(int fd, int idx)
          * it is also what makes a dead socket show up as a failed write.
          */
         if (st->jpglen) {
-            copy = malloc(st->jpglen);
-            if (copy) {
-                memcpy(copy, st->jpg, st->jpglen);
+
+            if (cap < st->jpglen) {
+
+                unsigned char *nb = realloc(buf, st->jpglen);
+
+                if (nb) {
+                    buf = nb;
+                    cap = st->jpglen;
+                }
+            }
+
+            if (cap >= st->jpglen) {
+                memcpy(buf, st->jpg, st->jpglen);
                 len = st->jpglen;
             }
+
             got = st->seq;
         }
 
         pthread_mutex_unlock(&st->lock);
 
-        if (!copy) {
+        if (!len) {
             usleep(50000);
             continue;
         }
-
-        double t = now_sec();
-
-        if (min_interval > 0 && t - last_sent < min_interval) {
-            free(copy);
-            usleep((useconds_t)((min_interval - (t - last_sent)) * 1e6));
-            continue;
-        }
-
-        last_sent = t;
 
         char part[256];
 
@@ -1623,22 +1658,40 @@ static void serve_mjpeg(int fd, int idx)
                           "Content-Length: %zu\r\n"
                           "\r\n", len);
 
-        bool ok = write_all(fd, part, (size_t)pn) &&
-                  write_all(fd, copy, len) &&
-                  write_all(fd, "\r\n", 2);
-
-        free(copy);
-
-        if (!ok)
-            return;
+        if (!write_all(fd, part, (size_t)pn) ||
+            !write_all(fd, buf, len) ||
+            !write_all(fd, "\r\n", 2))
+            break;
     }
+
+    atomic_fetch_sub(&st->viewers, 1);
+    free(buf);
 }
 
 static void serve_snapshot(int fd, int idx)
 {
     stream_t *st = &streams[idx];
 
+    /*
+     * Nothing is encoded for a stream nobody is watching, so register as a
+     * viewer and, if the source is live, give the capture thread a moment to
+     * produce a fresh frame rather than handing out a stale one.
+     */
+    atomic_fetch_add(&st->viewers, 1);
+
     pthread_mutex_lock(&st->lock);
+
+    if (now_sec() - st->last_src < 1.0) {
+
+        struct timespec ts;
+        uint64_t        want = st->seq;
+
+        deadline_in(&ts, 250);
+
+        while (st->seq == want &&
+               pthread_cond_timedwait(&st->cv, &st->lock, &ts) != ETIMEDOUT)
+            ;
+    }
 
     size_t         len  = st->jpglen;
     unsigned char *copy = len ? malloc(len) : NULL;
@@ -1647,6 +1700,8 @@ static void serve_snapshot(int fd, int idx)
         memcpy(copy, st->jpg, len);
 
     pthread_mutex_unlock(&st->lock);
+
+    atomic_fetch_sub(&st->viewers, 1);
 
     if (!copy) {
         send_simple(fd, "503 Service Unavailable", "text/plain",
@@ -1690,12 +1745,18 @@ static void serve_status(int fd)
 
         pthread_mutex_lock(&streams[i].lock);
 
+        char age[32] = "null";
+
+        if (streams[i].frames)
+            snprintf(age, sizeof(age), "%.1f", now_sec() - streams[i].last_src);
+
         n += snprintf(body + n, sizeof(body) - n,
                       "%s\n    {\"path\": \"/%d\", \"frames\": %llu, "
-                      "\"age_s\": %.1f}",
+                      "\"age_s\": %s, \"viewers\": %d}",
                       i ? "," : "", i,
                       (unsigned long long)streams[i].frames,
-                      now_sec() - streams[i].last_frame);
+                      age,
+                      atomic_load(&streams[i].viewers));
 
         pthread_mutex_unlock(&streams[i].lock);
     }
@@ -1804,7 +1865,7 @@ static void usage(const char *a0)
     printf(
 "Usage: %s [options]\n"
 "\n"
-"  --port N          HTTP port (default 8080)\n"
+"  --port N          HTTP port (default 8090)\n"
 "  --quality N       JPEG quality 1-100 (default 80)\n"
 "  --fps N           max frames per second per client (default 60)\n"
 "  --scale N         downscale by N (default 1)\n"
@@ -1873,6 +1934,27 @@ int main(int argc, char **argv)
 
     (void)opt_verbose;
 
+    /* settle the crop and scale once instead of on every frame */
+    {
+        unsigned cw = opt_cw > 0 ? (unsigned)opt_cw : EYE_STRIDE;
+        unsigned ch = opt_ch > 0 ? (unsigned)opt_ch : EYE_HEIGHT;
+
+        out_x = opt_cx > 0 && opt_cx < EYE_STRIDE ? (unsigned)opt_cx : 0;
+        out_y = opt_cy > 0 && opt_cy < EYE_HEIGHT ? (unsigned)opt_cy : 0;
+
+        if (out_x + cw > EYE_STRIDE) cw = EYE_STRIDE - out_x;
+        if (out_y + ch > EYE_HEIGHT) ch = EYE_HEIGHT - out_y;
+
+        out_scale = opt_scale < 1 ? 1 : (unsigned)opt_scale;
+        out_w     = cw / out_scale;
+        out_h     = ch / out_scale;
+
+        if (!out_w || !out_h) {
+            fprintf(stderr, "--crop / --scale leave nothing to encode\n");
+            return 1;
+        }
+    }
+
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
@@ -1880,6 +1962,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < MAX_STREAMS; i++) {
         pthread_mutex_init(&streams[i].lock, NULL);
         pthread_cond_init(&streams[i].cv, NULL);
+        setup_encoder(&streams[i]);
     }
 
     /* Something to hand out before any real frame exists. */

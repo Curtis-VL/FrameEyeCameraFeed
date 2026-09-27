@@ -1,0 +1,4 @@
+# These run on the headset; CRLF line endings would break them.
+*.sh    text eol=lf
+*.c     text eol=lf
+Makefile text eol=lf

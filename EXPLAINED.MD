@@ -91,7 +91,7 @@ Serves the eye cameras as MJPEG over HTTP so they can be pasted straight into
 EyeTrackVR's camera address field.
 
 ```bash
-gcc -O2 -Wall -o framestream framestream.c -ljpeg -lpthread -lm
+make
 sudo ./framestream --port 8090
 ```
 
@@ -170,13 +170,44 @@ Port 8090 is the default because Steam's `steamwebhelper` already listens on
 ## Starting at boot
 
 ```bash
-sudo bash install-service.sh
+curl -fsSL https://github.com/Curtis-VL/FrameEyeCameraFeed/releases/latest/download/install.sh | sudo bash
 ```
 
-That builds `framestream`, installs it to `/home/steamos/bin` (which survives
+That downloads the prebuilt `framestream` from the latest release, checks it
+against `SHA256SUMS`, installs it to `/home/steamos/bin` (which survives
 SteamOS updates), writes `/etc/systemd/system/framestream.service`, enables it
 and starts it. A major SteamOS update can replace the root partition and remove
-the unit — re-running the script restores it.
+the unit — re-running the command restores it. `sudo bash install.sh
+--from-source` in a checkout builds locally instead.
+
+Release binaries are fully static aarch64 executables (musl + libjpeg-turbo),
+so they don't depend on the headset's library versions. They are built by
+`.github/workflows/release.yml`; pushing a `v*` tag publishes a release. To
+build the same thing locally:
+
+```bash
+docker run --rm --platform linux/arm64 -v "$PWD:/src" -w /src \
+    alpine:3.20 sh scripts/build-release.sh
+```
+
+## Keeping it cheap
+
+The headset is also running the compositor and the tracking stack, so the
+daemon tries to stay out of the way:
+
+- Once locked on, it only fingerprints the ring slots. The whole-arena block
+  scan used to find them runs only while searching.
+- A stream is only JPEG-encoded while someone is watching it, so `/2` (the
+  debugging view) costs nothing unless it's open, and nothing is encoded when
+  no client is connected at all.
+- Encoding reuses the compressor and buffers and runs outside the stream lock,
+  and rows go to libjpeg directly from the source without copying unless a flip
+  or scale needs them rearranged.
+- XRService exiting is detected by polling its pidfd, rather than re-reading
+  `/proc` hundreds of times a second.
+- The `--fps` cap works on a schedule with some slack. The older "at least
+  1/fps since the last frame" check dropped every frame seen slightly early on
+  the 3 ms poll, and delivered only 37–53 fps against a target of 60.
 
 ```bash
 systemctl status framestream

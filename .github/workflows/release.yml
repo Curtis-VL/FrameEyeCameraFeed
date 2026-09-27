@@ -1,0 +1,41 @@
+name: build
+
+# Every push builds the binaries (downloadable from the run's artifacts).
+# Pushing a tag like v1.0.0 also publishes them as a GitHub release, which is
+# what install.sh downloads from.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Native arm64 runner; the build itself runs in Alpine so the binaries can
+    # be linked fully static against musl and libjpeg-turbo.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build static binaries
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.20 \
+              sh scripts/build-release.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: framestream-linux-arm64
+          path: dist/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
