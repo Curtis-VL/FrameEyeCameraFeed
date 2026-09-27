@@ -108,6 +108,17 @@ typedef struct {
     double          next_due;       /* output rate limiter schedule          */
 } stream_t;
 
+/* the eye-frame ring: one origin, one pitch, N slots derived from it */
+typedef struct {
+    int             arena;
+    int             slots;
+    long            pitch;
+    size_t          off[MAX_RING];
+    uint64_t        fp[MAX_RING];
+    int             eye[MAX_RING];      /* which physical eye each slot holds */
+    bool            both_eyes;
+} ring_t;
+
 /* --------------------------------------------------------------- globals */
 
 static arena_t  arenas[MAX_ARENAS];
@@ -118,12 +129,11 @@ static stream_t streams[MAX_STREAMS];
 static pid_t    xr_pid;
 static int      xr_pidfd = -1;
 
-/* the eye-frame ring: one origin, one pitch, N slots derived from it */
-static int      ring_arena;
-static size_t   ring_off[MAX_RING];
-static uint64_t ring_fp[MAX_RING];
-static int      ring_slots;
-static int      slot_eye[MAX_RING];
+/* the ring being streamed, and the capture thread's state around it */
+static ring_t   ring;
+static bool     locked;                 /* ring is valid and being streamed */
+static double   last_any;               /* when a ring slot last changed    */
+static int      refreshes[MAX_RING];    /* --verbose statistics             */
 
 static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
 static char     status_line[256] = "starting";
@@ -866,7 +876,25 @@ static void reset_block_changes(void)
     clear_block_changes();
 }
 
-static bool discover_ring(void)
+static void discovery_wait(void);
+
+static void log_ring(const char *what, const ring_t *r)
+{
+    char map[MAX_RING * 2 + 1];
+    int  mp = 0;
+
+    for (int k = 0; k < r->slots && mp < (int)sizeof(map) - 2; k++) {
+        map[mp++] = (char)('0' + r->eye[k]);
+        map[mp++] = ' ';
+    }
+
+    map[mp] = 0;
+
+    logmsg("%s %d slots at 0x%zx, pitch %ld bytes; eye map: %s",
+           what, r->slots, r->off[0], r->pitch, map);
+}
+
+static bool discover_ring(ring_t *r)
 {
     size_t need = (size_t)EYE_STRIDE * EYE_HEIGHT;
 
@@ -985,7 +1013,7 @@ static bool discover_ring(void)
                 }
             }
 
-            usleep(4000);
+            discovery_wait();
         }
 
         for (int k = 0; k < ncand; k++)
@@ -1086,8 +1114,8 @@ static bool discover_ring(void)
         if (!looks_like_eye_frame(arenas[a].map + o))
             break;
 
-        ring_off[n] = (size_t)o;
-        ring_fp[n]  = fingerprint(arenas[a].map + o, need);
+        r->off[n] = (size_t)o;
+        r->fp[n]  = fingerprint(arenas[a].map + o, need);
         n++;
     }
 
@@ -1133,10 +1161,10 @@ static bool discover_ring(void)
 
             for (int k = 0; k < n; k++) {
 
-                if (ring_off[k] + d + need > arenas[a].size)
+                if (r->off[k] + d + need > arenas[a].size)
                     continue;
 
-                v += edge_darkness(arenas[a].map + ring_off[k] + d);
+                v += edge_darkness(arenas[a].map + r->off[k] + d);
                 c++;
             }
 
@@ -1151,8 +1179,8 @@ static bool discover_ring(void)
             int keep = 0;
 
             for (int k = 0; k < n; k++)
-                if (ring_off[k] + bestd + need <= arenas[a].size)
-                    ring_off[keep++] = ring_off[k] + bestd;
+                if (r->off[k] + bestd + need <= arenas[a].size)
+                    r->off[keep++] = r->off[k] + bestd;
 
             n = keep;
 
@@ -1160,7 +1188,7 @@ static bool discover_ring(void)
                 return false;
 
             for (int k = 0; k < n; k++)
-                ring_fp[k] = fingerprint(arenas[a].map + ring_off[k], need);
+                r->fp[k] = fingerprint(arenas[a].map + r->off[k], need);
         }
     }
 
@@ -1174,7 +1202,7 @@ static bool discover_ring(void)
         uint64_t before[MAX_RING];
 
         for (int k = 0; k < n; k++)
-            before[k] = fingerprint(arenas[a].map + ring_off[k], need);
+            before[k] = fingerprint(arenas[a].map + r->off[k], need);
 
         double t1 = now_sec();
 
@@ -1185,31 +1213,32 @@ static bool discover_ring(void)
         while (now_sec() - t1 < 0.6 && running) {
 
             for (int k = 0; k < n; k++)
-                if (fingerprint(arenas[a].map + ring_off[k], need) != before[k])
+                if (fingerprint(arenas[a].map + r->off[k], need) != before[k])
                     seen[k] = true;
 
-            usleep(4000);
+            discovery_wait();
         }
 
         int keep = 0;
 
         for (int k = 0; k < n; k++)
             if (!seen[k])
-                vlog("  slot 0x%zx did not refresh in 0.6 s -> dropped", ring_off[k]);
+                vlog("  slot 0x%zx did not refresh in 0.6 s -> dropped", r->off[k]);
 
         for (int k = 0; k < n; k++)
             if (seen[k])
-                ring_off[keep++] = ring_off[k];
+                r->off[keep++] = r->off[k];
 
         if (keep >= 2) {
             n = keep;
             for (int k = 0; k < n; k++)
-                ring_fp[k] = fingerprint(arenas[a].map + ring_off[k], need);
+                r->fp[k] = fingerprint(arenas[a].map + r->off[k], need);
         }
     }
 
-    ring_arena = a;
-    ring_slots = n;
+    r->arena = a;
+    r->slots = n;
+    r->pitch = pitch;
 
     /*
      * ---- 6. work out which eye each slot belongs to.
@@ -1221,7 +1250,7 @@ static bool discover_ring(void)
     static float prof[MAX_RING][EYE_STRIDE];
 
     for (int k = 0; k < n; k++)
-        column_profile(arenas[a].map + ring_off[k], prof[k]);
+        column_profile(arenas[a].map + r->off[k], prof[k]);
 
     double dist[MAX_RING];
     double dmin = 1e18, dmax = -1e18;
@@ -1240,7 +1269,7 @@ static bool discover_ring(void)
     vlog("  spread %.2f (under 0.8 means one eye only)", dmax - dmin);
 
     for (int k = 0; k < n; k++)
-        slot_eye[k] = dist[k] > split ? 1 : 0;
+        r->eye[k] = dist[k] > split ? 1 : 0;
 
     /* stream 0 is the eye sitting further left, so the mapping is stable */
     double cx[2] = { 0, 0 };
@@ -1256,33 +1285,22 @@ static bool discover_ring(void)
         }
 
         if (den > 1) {
-            cx[slot_eye[k]] += num / den;
-            cn[slot_eye[k]]++;
+            cx[r->eye[k]] += num / den;
+            cn[r->eye[k]]++;
         }
     }
 
     if (cn[0] && cn[1] && (cx[0] / cn[0]) > (cx[1] / cn[1]))
         for (int k = 0; k < n; k++)
-            slot_eye[k] ^= 1;
+            r->eye[k] ^= 1;
 
-    if (dmax - dmin < 0.8) {
+    r->both_eyes = dmax - dmin >= 0.8;
+
+    if (!r->both_eyes) {
         /* only one eye visible in this ring - send everything to stream 0 */
         for (int k = 0; k < n; k++)
-            slot_eye[k] = 0;
+            r->eye[k] = 0;
     }
-
-    char map[MAX_RING * 2 + 1];
-    int  mp = 0;
-
-    for (int k = 0; k < n && mp < (int)sizeof(map) - 2; k++) {
-        map[mp++] = (char)('0' + slot_eye[k]);
-        map[mp++] = ' ';
-    }
-
-    map[mp] = 0;
-
-    logmsg("locked %d slots at 0x%zx, pitch %ld bytes; eye map: %s",
-           n, ring_off[0], pitch, map);
 
     return true;
 }
@@ -1444,18 +1462,77 @@ static void publish_placeholder(void)
 
 /* ------------------------------------------------------- capture pipeline */
 
+/* Publish whatever the ring being streamed has new since the last look. */
+static void poll_ring(void)
+{
+    if (!locked)
+        return;
+
+    bool   any = false;
+    double t   = now_sec();
+
+    /* whichever slot just changed is holding the newest frame */
+    for (int i = 0; i < ring.slots; i++) {
+
+        const unsigned char *src = arenas[ring.arena].map + ring.off[i];
+        uint64_t fp = fingerprint(src, (size_t)EYE_STRIDE * EYE_HEIGHT);
+
+        if (fp == ring.fp[i])
+            continue;
+
+        ring.fp[i] = fp;
+        any = true;
+        refreshes[i]++;
+
+        int phys = ring.eye[i];
+        int strm = opt_swap ? 1 - phys : phys;
+
+        /* stream 2 is the raw frame, unflipped, for checking framing */
+        publish(&streams[2], src, 0, t);
+        publish(&streams[strm], src, opt_flip[phys], t);
+    }
+
+    if (any)
+        last_any = t;
+}
+
+/*
+ * Discovery spends over a second confirming that candidates keep refreshing.
+ * When it runs while a ring is already being streamed, keep that stream
+ * going in the meantime rather than freezing it.
+ */
+static void discovery_wait(void)
+{
+    poll_ring();
+    usleep(4000);
+}
+
+/* A ring was found: start streaming it. */
+static void adopt_ring(const ring_t *r, const char *what)
+{
+    ring   = *r;
+    locked = true;
+
+    memset(refreshes, 0, sizeof(refreshes));
+    log_ring(what, &ring);
+
+    if (ring.both_eyes)
+        set_status("streaming: ring of %d slot(s)", ring.slots);
+    else
+        set_status("streaming one eye (%d slots) - still looking for the other",
+                   ring.slots);
+}
+
 static void *capture_thread(void *arg)
 {
     (void)arg;
 
-    double last_scan  = 0;
-    double last_any   = 0;
-    double last_check = 0;
-    int    misaligned = 0;
-    bool   locked     = false;
-
-    int    refreshes[MAX_RING] = { 0 };     /* --verbose statistics */
+    double last_scan   = 0;
+    double last_check  = 0;
     double last_report = 0;
+    double last_search = 0;
+    double search_from = 0;     /* background search: when tracking began */
+    int    misaligned  = 0;
 
     while (running) {
 
@@ -1514,15 +1591,18 @@ static void *capture_thread(void *arg)
 
             if (now_sec() - last_scan > 1.0 && headset_worn()) {
 
+                ring_t found;
+
                 last_scan = now_sec();
 
-                if (discover_ring()) {
-                    locked      = true;
+                if (discover_ring(&found)) {
+                    adopt_ring(&found, "locked");
                     last_any    = now_sec();
                     last_check  = now_sec();
                     last_report = now_sec();
-                    misaligned = 0;
-                    set_status("streaming: ring of %d slot(s)", ring_slots);
+                    last_search = now_sec();
+                    search_from = 0;
+                    misaligned  = 0;
                 } else {
                     clear_block_changes();
                 }
@@ -1532,39 +1612,16 @@ static void *capture_thread(void *arg)
             continue;
         }
 
-        /* Locked: whichever slot just changed is holding the newest frame. */
-        bool   any = false;
-        double t   = now_sec();
+        poll_ring();
 
-        for (int i = 0; i < ring_slots; i++) {
-
-            const unsigned char *src = arenas[ring_arena].map + ring_off[i];
-            uint64_t fp = fingerprint(src, (size_t)EYE_STRIDE * EYE_HEIGHT);
-
-            if (fp == ring_fp[i])
-                continue;
-
-            ring_fp[i] = fp;
-            any = true;
-            refreshes[i]++;
-
-            int phys = slot_eye[i];
-            int strm = opt_swap ? 1 - phys : phys;
-
-            /* stream 2 is the raw frame, unflipped, for checking framing */
-            publish(&streams[2], src, 0, t);
-            publish(&streams[strm], src, opt_flip[phys], t);
-        }
-
-        if (any)
-            last_any = t;
+        double t = now_sec();
 
         if (opt_verbose && t - last_report >= 5.0) {
 
             char line[MAX_RING * 6 + 1];
             int  lp = 0;
 
-            for (int i = 0; i < ring_slots && lp < (int)sizeof(line) - 6; i++)
+            for (int i = 0; i < ring.slots && lp < (int)sizeof(line) - 6; i++)
                 lp += snprintf(line + lp, sizeof(line) - lp, " %d", refreshes[i]);
 
             line[lp] = 0;
@@ -1575,6 +1632,44 @@ static void *capture_thread(void *arg)
         }
 
         /*
+         * Locked onto one eye only.  Eye tracking runs a reduced mode when the
+         * proximity sensor is merely covered rather than the headset worn:
+         * one eye's frames, in bursts.  Put the headset on afterwards and the
+         * other eye's slots come to life - but the slots we have keep
+         * refreshing, so nothing would ever go looking for them, and only a
+         * restart found both eyes.  So while one-eyed, search again every few
+         * seconds, streaming the current ring throughout, and switch over as
+         * soon as a ring with both eyes turns up.
+         *
+         * Discovery works on memory that changed recently, so each attempt
+         * starts change tracking and runs half a second later.  Tracking costs
+         * a pass over the whole arena, which is why it is otherwise off while
+         * locked.
+         */
+        if (!ring.both_eyes && !search_from && t - last_search > 5.0) {
+            reset_block_changes();
+            search_from = t;
+        }
+
+        if (search_from && t - search_from > 0.5) {
+
+            ring_t found;
+
+            note_block_changes();
+            vlog("one eye only - searching for the other");
+
+            if (discover_ring(&found) && found.both_eyes) {
+                adopt_ring(&found, "found both eyes, switching to");
+                last_check = now_sec();
+                misaligned = 0;
+            }
+
+            search_from = 0;
+            last_search = now_sec();
+            continue;
+        }
+
+        /*
          * Re-check alignment periodically.  Each origin is pinned once at lock
          * time, which is right as long as the producer keeps reusing the same
          * slots; if anything ever moves underneath us the picture would quietly
@@ -1582,11 +1677,11 @@ static void *capture_thread(void *arg)
          * and re-lock if it does not.  Several consecutive failures are needed
          * so one odd frame cannot trip it.
          */
-        if (ring_slots && now_sec() - last_check > 20.0) {
+        if (ring.slots && t - last_check > 20.0) {
 
-            last_check = now_sec();
+            last_check = t;
 
-            const unsigned char *p0 = arenas[ring_arena].map + ring_off[0];
+            const unsigned char *p0 = arenas[ring.arena].map + ring.off[0];
 
             if (looks_like_eye_frame(p0)) {
                 misaligned = 0;
@@ -1599,7 +1694,7 @@ static void *capture_thread(void *arg)
             }
         }
 
-        if (now_sec() - last_any > 10.0) {
+        if (t - last_any > 10.0) {
             logmsg("eye frames stopped, rescanning");
             locked = false;
             reset_block_changes();
@@ -1864,7 +1959,7 @@ static void serve_status(int fd)
                      "  \"xrservice_pid\": %d,\n"
                      "  \"arenas\": %d,\n"
                      "  \"ring_slots\": %d,\n"
-                     "  \"streams\": [", st, xr_pid, narenas, ring_slots);
+                     "  \"streams\": [", st, xr_pid, narenas, ring.slots);
 
     for (int i = 0; i < 3 && n < (int)sizeof(body) - 200; i++) {
 

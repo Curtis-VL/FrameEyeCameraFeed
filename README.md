@@ -46,5 +46,8 @@ I'd advise only using this if you're also familiar enough with Linux to fix any 
 Eye camera streams are blank?
 Put on the headset. The eye tracking service stops when the headset isn't on, thus no buffers to find for the stream.
 
+Only /0 shows anything, and it keeps pausing?
+That's what happens when the proximity sensor is just covered instead of the headset being worn: eye tracking then only runs one eye, in bursts. Put the headset on and the second eye gets picked up within a few seconds.
+
 Eye camera streams appear wrong?
 Take off the headset for a few seconds, put it back on.
