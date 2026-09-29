@@ -71,6 +71,8 @@ Follow the instructions on the page for this custom EyeTrackVR VRCFaceTracking p
 
 ### You're done!
 
+**Tip:** You can use VRCX's auto-start feature to automatically start EyeTrackVR and VRCFaceTracking when you launch VRChat!
+
 Enjoy showing everyone your eye balls!
 
 
