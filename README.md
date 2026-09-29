@@ -11,9 +11,9 @@ See [Here](/EXPLAINED.MD) for an AI generated explanation of how this works to b
 
 # What to expect
 
-This application provides the eye camera feeds from the Steam Frame in a format that EyeTrackVR can accept.
+This application provides the eye camera feeds from the Steam Frame in a format that EyeTrackVR (And Baballonia/other softrware) can accept.
 
-EyeTrackVR seems to have some troubles with the gaze, however, it will provide lid position (Blink/Wink) and also pupil dilation.
+EyeTrackVR seems to have some troubles with the gaze, however, it will provide lid position (Blink/Wink), pupil dilation, and can simulate eyebrow positions.
 
 In my own testing, I used Steam Link's 'Enable OSC' and 'Share face tracking data to other apps on this PC via OSC' options for gaze, whilst using ETVR for lid position and pupil dilation.
 
@@ -47,6 +47,9 @@ http://frame-local-ip:8090/0
 The installer prints the exact addresses when it finishes, but the above should work regardless.
 
 **Note:** It may be best to look at your router's DHCP settings to ensure the Frame's IP remains the same over time.
+
+**Note 2:** EyeTrackVR struggles with getting the gaze correct, I suggest using the Steam Link OSC options for gaze and ETVR for everything else. You can do this by just enabling the Steam Link OSC settings whilst VRCFT is running for ETVR.
+
 
 # Check status
 
