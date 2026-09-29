@@ -15,18 +15,18 @@ This application provides the eye camera feeds from the Steam Frame in a format 
 
 EyeTrackVR seems to have some troubles with the gaze, however, it will provide lid position (Blink/Wink), pupil dilation, and can simulate eyebrow positions.
 
-In my own testing, I used Steam Link's 'Enable OSC' and 'Share face tracking data to other apps on this PC via OSC' options for gaze, whilst using ETVR for lid position and pupil dilation.
+I've created a custom version of the EyeTrackVR VRCFT module that takes (And smoothes out) the Steam Link OSC gaze data and combines it with the EyeTrackVR data. I highly suggest using that alongside this instead of the regular EyeTrackVR VRCFT plugin.
 
-The gaze tracking from Steam Link is jittery locally, but this jittery isn't really visible to others over the network.
+[Recommended module for VRCFT: ETVRTrackingModule-SteamLink](https://github.com/Curtis-VL/ETVRTrackingModule-SteamLink)
 
-https://github.com/user-attachments/assets/133d68aa-2698-489c-870e-a1b597f286f2
-
-(There's no pupil dilation on my avatar, but you get the gist)
+https://github.com/user-attachments/assets/30928f5e-88ea-4b6f-920a-b49010649131
 
 
-# How to Use
+# Setup - Step-by-step
 
-You'll need to set the user password in the developer settings on the headset to either connect to the headset via SSH, or to enter the admin password whem prompted to run the following command.
+### Install FrameEyeCameraFeed on the Frame
+
+You'll need to set the user password in the developer settings on the headset to either connect to the headset via SSH.
 
 To install, run:
 
@@ -48,7 +48,30 @@ The installer prints the exact addresses when it finishes, but the above should 
 
 **Note:** It may be best to look at your router's DHCP settings to ensure the Frame's IP remains the same over time.
 
-**Note 2:** EyeTrackVR struggles with getting the gaze correct, I suggest using the Steam Link OSC options for gaze and ETVR for everything else. You can do this by just enabling the Steam Link OSC settings whilst VRCFT is running for ETVR.
+
+### Install EyeTrackVR
+
+You can download the latest EyeTrackVR version from their GitHub repo:
+[EyeTrackVR download](https://github.com/EyeTrackVR/EyeTrackVR/releases)
+
+Once installed, enter the stream URLs above into the 'Address' fields and click Connect on the left. You should now see the eye camera feeds in EyeTrackVR. (If you don't put on the headset for a few seconds and check again)
+
+With the headset on, click 'Start Calibration' and follow the instructions provided in VR.
+
+Go to the 'Algo Settings' tab at the top and click 'Manual Eyelid Tuning'
+Here you can set the point that is considered a full blink and when the eye is fully open to avoid half closed or half open eyes. Tune this as needed.
+
+Optionally, go to the 'VRCFT Module Settings' tab at the top and turn on 'Emulate Eye Widen', 'Emulate Eye Squint', and 'Emulate eyebrows'
+
+### Install the VRCFaceTracking plugin
+
+Follow the instructions on the page for this custom EyeTrackVR VRCFaceTracking plugin, it is highly recommended you use this instead of the regular EyeTrackVR plugin as this one will merge in the Steam Link OSC gaze data to compensate for EyeTrackVR struggling to get accurate gaze data with the Frame.
+
+[Recommended module for VRCFT: ETVRTrackingModule-SteamLink](https://github.com/Curtis-VL/ETVRTrackingModule-SteamLink)
+
+### You're done!
+
+Enjoy showing everyone your eye balls!
 
 
 # Check status
