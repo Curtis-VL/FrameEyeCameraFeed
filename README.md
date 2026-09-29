@@ -40,9 +40,9 @@ Re-run the same command to update, or if a major SteamOS update removes the serv
 
 Stream URLs for EyeTrackVR should now be available at:
 
-http://frame-local-ip:8090/1
+http://frame:8090/1
 
-http://frame-local-ip:8090/0
+http://frame:8090/0
 
 The installer prints the exact addresses when it finishes, but the above should work regardless.
 
@@ -55,11 +55,11 @@ The installer prints the exact addresses when it finishes, but the above should 
 
 You can check the status of the application and preview the camera feeds at:
 
-http://frame-local-ip:8090
+http://frame:8090
 
 There's also a JSON status that you can hook into at:
 
-http://frame-local-ip:8090/status
+http://frame:8090/status
 
 <img width="837" height="498" alt="image" src="https://github.com/user-attachments/assets/2da6e4a1-0ae1-4047-8707-320909434236" />
 
