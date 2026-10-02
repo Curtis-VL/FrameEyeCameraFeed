@@ -1,7 +1,5 @@
 # FrameEyeCameraFeed — Steam Frame eye camera capture
 
-**Disclaimer:** This is heavily **AI generated**, use at your own risk.
-
 Captures the Steam Frame eye camera feeds and hosts them in a format accepted by EyeTrackVR.
 
 Capture is achieved by borrowing the DMA-BUF file
@@ -21,6 +19,12 @@ I've created a custom version of the EyeTrackVR VRCFT module that takes (And smo
 
 https://github.com/user-attachments/assets/30928f5e-88ea-4b6f-920a-b49010649131
 
+
+# Setup - Automatic (Easiest and fastest)
+
+Check out the automatic installer here, this'll also guide you through setting it up for VRChat alongside EyeTrackVR!
+
+[Automatical installer](https://github.com/Curtis-VL/FrameEyeCameraFeed-Installer/)
 
 # Setup - Step-by-step
 
