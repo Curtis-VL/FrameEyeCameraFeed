@@ -26,7 +26,7 @@ https://github.com/user-attachments/assets/30928f5e-88ea-4b6f-920a-b49010649131
 
 ### Install FrameEyeCameraFeed on the Frame
 
-You'll need to set the user password in the developer settings on the headset to either connect to the headset via SSH.
+You'll need to set the user password in the developer settings on the headset to connect to the headset via SSH or enter the password when prompted from 'Konsole' within the headset.
 
 To install, run:
 
